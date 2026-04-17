@@ -637,13 +637,9 @@ Parse the user's input to determine which mode to run:
    - Otherwise, ask: "What would you like to ask Codex?"
 4. `/codex <anything else>` — **Consult mode** (Step 2C), where the remaining text is the prompt
 
-**Reasoning effort override:** If the user's input contains `--xhigh` anywhere,
-note it and remove it from the prompt text before passing to Codex. When `--xhigh`
-is present, use `model_reasoning_effort="xhigh"` for all modes regardless of the
-per-mode default below. Otherwise, use the per-mode defaults:
-- Review (2A): `high` — bounded diff input, needs thoroughness
-- Challenge (2B): `high` — adversarial but bounded by diff
-- Consult (2C): `medium` — large context, interactive, needs speed
+**Reasoning effort:** All modes default to `model_reasoning_effort="xhigh"` (maximum
+reasoning depth). Users can override with `--high` or `--medium` for faster but
+shallower runs.
 
 ---
 
@@ -655,6 +651,97 @@ All prompts sent to Codex MUST be prefixed with this boundary instruction:
 
 This applies to Review mode (prompt argument), Challenge mode (prompt), and Consult
 mode (persona prompt). Reference this section as "the filesystem boundary" below.
+
+---
+
+## Convergence Loop Protocol
+
+All three modes (Review, Challenge, Consult) share this protocol. After Codex responds
+and output is presented, enter this loop to resolve every finding before completing.
+
+**Entry condition:**
+- Review/Challenge: Always enter if Codex found any issues (P1, P2, or described problems)
+- Consult: Enter only if Codex's response contains actionable code issues or concrete
+  suggestions for changes. Pure Q&A answers with no issues skip the loop.
+
+**Round counter:** Start at round 1. Max 20 rounds.
+
+**Stale issue tracker:** For each distinct issue, track how many consecutive rounds
+it appears without resolution change.
+
+### L1: Analyze Codex Output
+
+Parse every finding/issue/suggestion from Codex's response. For each item:
+
+a) **Read the relevant code** at the exact location Codex referenced. Verify
+   independently whether the issue is real.
+
+b) **Classify:**
+   - **CONFIRMED** — real issue, will fix
+   - **FALSE_POSITIVE** — Codex is wrong (state evidence)
+   - **WONTFIX** — issue exists but not worth fixing (state reason)
+
+### L2: Fix CONFIRMED Issues
+
+For each CONFIRMED item:
+1. Fix the code using Edit/Write
+2. Run the project's test command (read from CLAUDE.md) to verify no regression
+3. Commit:
+   ```bash
+   git add <changed files> && git commit -m "fix: <description> (codex <mode> finding)"
+   ```
+
+### L3: Check for Stale Disputes
+
+If any issue has been classified FALSE_POSITIVE or WONTFIX by Claude but Codex keeps
+flagging it for **3+ consecutive rounds**, stop the loop and use AskUserQuestion:
+
+```
+Claude 和 Codex 在以下问题上无法达成一致（已持续 N 轮）:
+
+问题: <description>
+Codex 认为: <Codex's position>
+Claude 认为: <Claude's position>
+
+RECOMMENDATION: Choose the option that addresses the root concern.
+
+A) 按 Codex 的建议修复
+B) 按 Claude 的判断保持不变
+C) 我来决定（说明你的想法）
+```
+
+Apply the user's decision and continue the loop.
+
+### L4: Re-run Codex
+
+After all CONFIRMED fixes are committed, re-run Codex with the **same mode and parameters:**
+- Review: re-run `codex review` (Step 2A, steps 2-6)
+- Challenge: re-run `codex exec` with same adversarial prompt (Step 2B, steps 2-3)
+- Consult: re-run `codex exec` with a follow-up prompt via session continuity, summarizing
+  what was fixed and asking "are there remaining issues?" (Step 2C, resumed session)
+
+Present new output in the same format.
+
+### L5: Loop or Exit
+
+- Codex reports **no findings** → **EXIT** (all resolved)
+- Codex reports **new or remaining findings** → increment round counter, go to L1
+- Round counter reaches **20** → **EXIT**, report all unresolved items to user
+
+### L6: Final Report
+
+```
+CODEX <MODE> 收敛报告:
+════════════════════════════════════════════════════════════
+总轮次: N
+初始发现: X
+已修复 (CONFIRMED): Y
+误报 (FALSE_POSITIVE): Z
+不修 (WONTFIX): W
+用户裁决: D
+最终状态: 全部解决 / 剩余 N 个未解决
+════════════════════════════════════════════════════════════
+```
 
 ---
 
@@ -673,10 +760,9 @@ instructions, append them after the boundary separated by a newline:
 ```bash
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
 cd "$_REPO_ROOT"
-codex review "IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only." --base <base> -c 'model_reasoning_effort="high"' --enable web_search_cached 2>"$TMPERR"
+codex review "IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only." --base <base> -c 'model_reasoning_effort="xhigh"' --enable web_search_cached 2>"$TMPERR"
 ```
 
-If the user passed `--xhigh`, use `"xhigh"` instead of `"high"`.
 
 Use `timeout: 300000` on the Bash call. If the user provided custom instructions
 (e.g., `/codex review focus on security`), append them after the boundary:
@@ -685,7 +771,7 @@ _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo"
 cd "$_REPO_ROOT"
 codex review "IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
 
-focus on security" --base <base> -c 'model_reasoning_effort="high"' --enable web_search_cached 2>"$TMPERR"
+focus on security" --base <base> -c 'model_reasoning_effort="xhigh"' --enable web_search_cached 2>"$TMPERR"
 ```
 
 3. Capture the output. Then parse cost from stderr:
@@ -724,16 +810,20 @@ CROSS-MODEL ANALYSIS:
   Agreement rate: X% (N/M total unique findings overlap)
 ```
 
-7. Persist the review result:
+7. **Convergence Loop:** If any findings exist (P1 or P2), proceed to the
+   Convergence Loop Protocol above. Loop until Codex reports no findings or
+   20 rounds are reached.
+
+8. Persist the review result:
 ```bash
-~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"codex-review","timestamp":"TIMESTAMP","status":"STATUS","gate":"GATE","findings":N,"findings_fixed":N,"commit":"'"$(git rev-parse --short HEAD)"'"}'
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"codex-review","timestamp":"TIMESTAMP","status":"STATUS","gate":"GATE","findings":N,"findings_fixed":N,"rounds":N,"commit":"'"$(git rev-parse --short HEAD)"'"}'
 ```
 
 Substitute: TIMESTAMP (ISO 8601), STATUS ("clean" if PASS, "issues_found" if FAIL),
-GATE ("pass" or "fail"), findings (count of [P1] + [P2] markers),
-findings_fixed (count of findings that were addressed/fixed before shipping).
+GATE ("pass" or "fail"), findings (total initial findings), findings_fixed (total
+confirmed fixes across all rounds), rounds (number of review cycles).
 
-8. Clean up temp files:
+9. Clean up temp files:
 ```bash
 rm -f "$TMPERR"
 ```
@@ -833,11 +923,10 @@ Review the changes on this branch against the base branch. Run `git diff origin/
 
 2. Run codex exec with **JSONL output** to capture reasoning traces and tool calls (5-minute timeout):
 
-If the user passed `--xhigh`, use `"xhigh"` instead of `"high"`.
 
 ```bash
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="high"' --enable web_search_cached --json 2>/dev/null | PYTHONUNBUFFERED=1 python3 -u -c "
+codex exec "<prompt>" -C "$_REPO_ROOT" -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>/dev/null | PYTHONUNBUFFERED=1 python3 -u -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -877,6 +966,10 @@ CODEX SAYS (adversarial challenge):
 ════════════════════════════════════════════════════════════
 Tokens: N | Est. cost: ~$X.XX
 ```
+
+4. **Convergence Loop:** If Codex found any issues (edge cases, security holes,
+   race conditions, etc.), proceed to the Convergence Loop Protocol above.
+   Loop until Codex reports no findings or 20 rounds are reached.
 
 ---
 
@@ -944,12 +1037,11 @@ For non-plan consult prompts (user typed `/codex <question>`), still prepend the
 
 4. Run codex exec with **JSONL output** to capture reasoning traces (5-minute timeout):
 
-If the user passed `--xhigh`, use `"xhigh"` instead of `"medium"`.
 
 For a **new session:**
 ```bash
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="medium"' --enable web_search_cached --json 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+codex exec "<prompt>" -C "$_REPO_ROOT" -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -983,7 +1075,7 @@ for line in sys.stdin:
 For a **resumed session** (user chose "Continue"):
 ```bash
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec resume <session-id> "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="medium"' --enable web_search_cached --json 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+codex exec resume <session-id> "<prompt>" -C "$_REPO_ROOT" -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
 <same python streaming parser as above, with flush=True on all print() calls>
 "
 ```
@@ -1011,6 +1103,12 @@ Session saved — run /codex again to continue this conversation.
    understanding. If there is a disagreement, flag it:
    "Note: Claude Code disagrees on X because Y."
 
+8. **Convergence Loop:** If Codex's response contains actionable code issues or
+   concrete suggestions for changes, proceed to the Convergence Loop Protocol above.
+   Use session continuity (resumed session) for re-runs. Loop until Codex confirms
+   no remaining issues or 20 rounds are reached. Pure Q&A answers with no actionable
+   issues skip the loop.
+
 ---
 
 ## Model & Reasoning
@@ -1019,14 +1117,12 @@ Session saved — run /codex again to continue this conversation.
 agentic coding model). This means as OpenAI ships newer models, /codex automatically
 uses them. If the user wants a specific model, pass `-m` through to codex.
 
-**Reasoning effort (per-mode defaults):**
-- **Review (2A):** `high` — bounded diff input, needs thoroughness but not max tokens
-- **Challenge (2B):** `high` — adversarial but bounded by diff size
-- **Consult (2C):** `medium` — large context (plans, codebase), interactive, needs speed
+**Reasoning effort (all modes):**
+- **Review (2A):** `xhigh` — maximum reasoning depth
+- **Challenge (2B):** `xhigh` — maximum reasoning depth
+- **Consult (2C):** `xhigh` — maximum reasoning depth
 
-`xhigh` uses ~23x more tokens than `high` and causes 50+ minute hangs on large context
-tasks (OpenAI issues #8545, #8402, #6931). Users can override with `--xhigh` flag
-(e.g., `/codex review --xhigh`) when they want maximum reasoning and are willing to wait.
+Users can override with `--high` or `--medium` for faster but shallower runs.
 
 **Web search:** All codex commands use `--enable web_search_cached` so Codex can look up
 docs and APIs during review. This is OpenAI's cached index — fast, no extra cost.
@@ -1061,7 +1157,7 @@ If token count is not available, display: `Tokens: unknown`
 
 ## Important Rules
 
-- **Never modify files.** This skill is read-only. Codex runs in read-only sandbox mode.
+- **Codex 本身不修改文件**（read-only sandbox），但 Claude 在 Convergence Loop 中直接修改代码修复问题。
 - **Present output verbatim.** Do not truncate, summarize, or editorialize Codex's output
   before showing it. Show it in full inside the CODEX SAYS block.
 - **Add synthesis after, not instead of.** Any Claude commentary comes after the full output.
